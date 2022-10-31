@@ -1,0 +1,79 @@
+From 510be5b3b13c836946f2a9f5d1534a5e20a044c1 Mon Sep 17 00:00:00 2001
+From: Aliaksei Katovich <aliaksei.katovich@gmail.com>
+Date: Thu, 6 Oct 2022 10:43:40 +0300
+Subject: [PATCH 1/1] ftrace: add custom sched task stat event
+
+---
+ include/trace/events/sched.h           |  2 ++
+ include/trace/events/sched_task_stat.h | 28 ++++++++++++++++++++++++++
+ kernel/sched/core.c                    |  6 ++++++
+ 3 files changed, 36 insertions(+)
+ create mode 100644 include/trace/events/sched_task_stat.h
+
+diff --git a/include/trace/events/sched.h b/include/trace/events/sched.h
+index fbb99a61f714..519199b0ada4 100644
+--- a/include/trace/events/sched.h
++++ b/include/trace/events/sched.h
+@@ -10,6 +10,8 @@
+ #include <linux/tracepoint.h>
+ #include <linux/binfmts.h>
+ 
++#include <trace/events/sched_task_stat.h>
++
+ /*
+  * Tracepoint for calling kthread_stop, performed to end a kthread:
+  */
+diff --git a/include/trace/events/sched_task_stat.h b/include/trace/events/sched_task_stat.h
+new file mode 100644
+index 000000000000..61f2394fddfa
+--- /dev/null
++++ b/include/trace/events/sched_task_stat.h
+@@ -0,0 +1,28 @@
++/* make sure at least these are set in kconfig:
++ *
++ * CONFIG_SCHED_INFO = y
++ * CONFIG_FTRACE = y
++ */
++
++TRACE_EVENT(sched_task_stat,
++	TP_PROTO(struct task_struct *t, unsigned char on, unsigned int cpu),
++	TP_ARGS(t, on, cpu),
++	TP_STRUCT__entry(
++		__field(u64, ts)
++		__field(pid_t, pid)
++		__field(unsigned char, on)
++		__field(unsigned int, cpu)
++		__field(unsigned long, pcount)
++		__array(char, comm, TASK_COMM_LEN)
++	),
++	TP_fast_assign(
++		__entry->ts = local_clock();
++		__entry->pid = t->pid;
++		__entry->on = on;
++		__entry->cpu = cpu;
++		__entry->pcount = t->sched_info.pcount;
++		memcpy(__entry->comm, t->comm, TASK_COMM_LEN);
++	),
++	TP_printk("%Lu %u %u %u %lu %s", __entry->ts, __entry->pid,
++		__entry->on, __entry->cpu, __entry->pcount, __entry->comm)
++);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index cb2aa2b54c7a..c9a892336759 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4997,6 +4997,12 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
+ {
+ 	kcov_prepare_switch(prev);
+ 	sched_info_switch(rq, prev, next);
++
++	if (prev != rq->idle) /* depart */
++		trace_sched_task_stat(prev, 0, task_cpu(prev));
++	if (next != rq->idle) /* arrive */
++		trace_sched_task_stat(next, 1, task_cpu(next));
++
+ 	perf_event_task_sched_out(prev, next);
+ 	rseq_preempt(prev);
+ 	fire_sched_out_preempt_notifiers(prev, next);
+-- 
+2.25.1
+
