@@ -38,6 +38,12 @@ constexpr uint32_t dot_color_ = IM_COL32(255, 255, 255, 200);
 constexpr uint32_t text_color_ = IM_COL32(200, 200, 200, 255);
 constexpr uint32_t cursor_color_ = IM_COL32(40, 40, 40, 255);
 
+enum trace_type : uint8_t {
+	TRACE_MARKER,
+	TRACE_SCHED_SWITCH,
+	TRACE_SCHED_TASK_STAT, /* custom trace */
+};
+
 struct gpu_job {
 	char *name = nullptr;
 	int32_t id = -1;
@@ -97,6 +103,8 @@ struct plot_data {
 	uint8_t cpu;
 	uint64_t pcount;
 	uint8_t id;
+	uint16_t prio;
+	char state;
 };
 
 struct plot {
@@ -204,6 +212,18 @@ static char *skip_blanks(char *ptr, char *end)
 	return ptr;
 }
 
+static void remove_trailing_blanks(char *ptr, char *end)
+{
+	while (ptr > end) {
+		if (isblank(*ptr)) {
+			ptr--;
+		} else {
+			*(ptr + 1) = '\0';
+			return;
+		}
+	}
+}
+
 static inline bool is_eol(char *ptr)
 {
 	return (*ptr == '\n' || *ptr == '\r');
@@ -230,6 +250,48 @@ static inline char *get_field_end(char *ptr, char *end)
 			break;
 	}
 
+	return ptr;
+}
+
+static inline char *get_taskpid_str(char *ptr, char *end, char **next)
+{
+	if (!(ptr = skip_blanks(ptr, end))) {
+		ee("unexpected end of data\n");
+		return nullptr;
+	}
+
+	char *tmp = ptr;
+	while (tmp < end) {
+		if (*tmp == '[')
+			break;
+		else
+			tmp++;
+	}
+
+	*next = tmp; /* next field to parse */
+	**next = '\0';
+
+	remove_trailing_blanks(tmp, ptr);
+	return ptr;
+}
+
+static inline char *get_comm_str(char *ptr, char *end, char **next,
+ const char *stop_at)
+{
+	char *tmp;
+	if (!(tmp = strstr(ptr, stop_at))) {
+		ee("failed to stop at '%s' in '%s'\n", stop_at, ptr);
+		return nullptr;
+	} else if (!(ptr = strchr(ptr, '='))) {
+		ee("failed to find prev_comm value\n");
+		return nullptr;
+	}
+
+	ptr++;
+	remove_trailing_blanks(tmp - 1, ptr);
+
+	*next = tmp;
+	**next = '\0';
 	return ptr;
 }
 
@@ -422,6 +484,7 @@ static void add_data_point(struct plot_data *data)
 	struct gpu_job job;
 
 	point.cpu = data->cpu;
+	point.state = data->state;
 	point.x = data->ts;
 
 	if (data->monitor && !axis->monitor)
@@ -511,7 +574,7 @@ static inline void sort_y_axes(void)
 	plot_.y_axes = std::move(axes);
 }
 
-static char *init_marker_data(struct plot_data *data, char *ptr, char *end)
+static char *parse_marker(struct plot_data *data, char *ptr, char *end)
 {
 	char *next;
 
@@ -524,7 +587,7 @@ static char *init_marker_data(struct plot_data *data, char *ptr, char *end)
 	return ptr;
 }
 
-static char *init_info_data(struct plot_data *data, char *ptr, char *end)
+static char *parse_task_stat(struct plot_data *data, char *ptr, char *end)
 {
 	char *next;
 
@@ -573,12 +636,86 @@ static char *init_info_data(struct plot_data *data, char *ptr, char *end)
 	return ptr;
 }
 
+/* fills two data structures */
+static char *parse_sched_switch(struct plot_data *data, char *ptr, char *end)
+{
+	char *next;
+
+	/* get prev task command */
+	if (!(ptr = get_comm_str(ptr, end, &next, "prev_pid")))
+		return nullptr;
+
+	data[0].comm = ptr;
+	ptr = next + 1;
+
+	/* get prev task pid */
+	if (!(ptr = get_data_field(ptr, end, &next)))
+		return nullptr;
+	else if (!(ptr = strchr(ptr, '=')))
+		return nullptr;
+
+	data[0].pid = atoi(++ptr);
+	ptr = next + 1;
+
+	/* get prev task prio */
+	if (!(ptr = get_data_field(ptr, end, &next)))
+		return nullptr;
+	else if (!(ptr = strchr(ptr, '=')))
+		return nullptr;
+
+	data[0].prio = atoi(++ptr);
+	ptr = next + 1;
+
+	/* get prev task state */
+	if (!(ptr = get_data_field(ptr, end, &next)))
+		return nullptr;
+	else if (!(ptr = strchr(ptr, '=')))
+		return nullptr;
+
+	data[0].state = *++ptr;
+	data[0].arrived = false;
+	ptr = next + 1;
+
+	/* skip '==>' */
+	if (!(ptr = get_data_field(ptr, end, &next)))
+		return nullptr;
+	ptr = next + 1;
+
+	/* get next task command */
+	if (!(ptr = get_comm_str(ptr, end, &next, "next_pid")))
+		return nullptr;
+
+	data[1].comm = ptr;
+	ptr = next + 1;
+
+	/* get next task pid */
+	if (!(ptr = get_data_field(ptr, end, &next)))
+		return nullptr;
+	else if (!(ptr = strchr(ptr, '=')))
+		return nullptr;
+
+	data[1].pid = atoi(++ptr);
+	ptr = next + 1;
+
+	/* get next task prio */
+	if (!(ptr = get_data_field(ptr, end, &next)))
+		return nullptr;
+	else if (!(ptr = strchr(ptr, '=')))
+		return nullptr;
+
+	data[1].prio = atoi(++ptr);
+	data[1].arrived = true;
+
+	return next;
+}
+
 static bool init_data(void)
 {
 	char *ptr = plot_.data;
 	char *end = plot_.data + plot_.file_size;
 	char *next;
 	bool marker;
+	enum trace_type type;
 	double trace_ts;
 	uint32_t trace_pid;
 	uint32_t trace_cpu;
@@ -591,13 +728,11 @@ static bool init_data(void)
 			continue;
 		}
 
-		/* skip some unused fields set by ftrace itself */
-
-		/* skip task-pid */
-		if (!(ptr = get_data_field(ptr, end, &next)))
+		/* task comm can contain spaces, so give it special treatment */
+		if (!(ptr = get_taskpid_str(ptr, end, &next))) {
+			ee("failed to parse task-pid field\n");
 			return false;
-
-		if (!parse_task_pid(ptr, next, &trace_comm, &trace_pid)) {
+		} else if (!parse_task_pid(ptr, next, &trace_comm, &trace_pid)) {
 			ee("malformed 'task-pid' field: '%s'\n", ptr);
 			return false;
 		}
@@ -627,10 +762,23 @@ static bool init_data(void)
 		if (!(ptr = get_data_field(ptr, end, &next)))
 			return false;
 
-		if (strcmp("tracing_mark_write:", ptr) == 0)
-			marker = true;
-		else
-			marker = false;
+		if (strcmp("tracing_mark_write:", ptr) == 0) {
+			type = TRACE_MARKER;
+		} else if (strcmp("sched_switch:", ptr) == 0) {
+			type = TRACE_SCHED_SWITCH;
+		} else if (strcmp("sched_task_info:", ptr) == 0) {
+			type = TRACE_SCHED_TASK_STAT;
+		} else if (strcmp("sched_task_stat:", ptr) == 0) {
+			type = TRACE_SCHED_TASK_STAT;
+		} else { /* not supported */
+			if (!(ptr = (char *) memchr(ptr, '\n', end - ptr))) {
+				ee("malformed string '%s'\n", ptr);
+				return false;
+			}
+
+			ptr++;
+			continue;
+		}
 
 		ptr = next + 1;
 
@@ -639,43 +787,62 @@ static bool init_data(void)
 
 		/* start task info fields */
 
-		struct plot_data data;
+		struct plot_data data[2];
+		data[0].comm = nullptr;
+		data[1].comm = nullptr;
+		data[0].ts = trace_ts;
+		data[1].ts = trace_ts;
 
-		if (marker) {
-			data.comm = trace_comm;
-			data.pid = trace_pid;
+		struct plot_data *data0 = &data[0];
 
-			if (!(ptr = init_marker_data(&data, ptr, end))) {
+		if (type == TRACE_MARKER) {
+			data[0].comm = trace_comm;
+			data[0].pid = trace_pid;
+
+			if (!(ptr = parse_marker(&data[0], ptr, end))) {
 				return false;
-			} else if (data.marker) {
-				data.monitor = is_monitor(data.marker);
-				data.gpu = is_gpu(data.marker);
+			} else if (data[0].marker) {
+				data[0].monitor = is_monitor(data[0].marker);
+				data[0].gpu = is_gpu(data[0].marker);
 
-				if (data.gpu)
-					data.comm = "gpu";
+				if (data[0].gpu)
+					data[0].comm = "gpu";
 			}
-		} else {
-			if (!(ptr = init_info_data(&data, ptr, end)))
+		} else if (type == TRACE_SCHED_TASK_STAT) {
+			if (!(ptr = parse_task_stat(&data[0], ptr, end)))
+				return false;
+		} else if (type == TRACE_SCHED_SWITCH) {
+			if (!(ptr = parse_sched_switch(data, ptr, end)))
 				return false;
 		}
-		data.ts = trace_ts - plot_.min_ts;
-		update_y_axis(data.comm, &data);
 
-		if (marker && !data.monitor && !data.gpu) {
-			update_y_markers(&data, trace_pid);
+		for (uint8_t i = 0; i < 2; ++i) {
+			if (!data[i].comm)
+				continue;
+
+			data[i].cpu = trace_cpu;
+			data[i].ts = trace_ts - plot_.min_ts;
+			update_y_axis(data[i].comm, &data[i]);
+
+			if (type == TRACE_MARKER && !data[i].monitor &&
+			 !data[i].gpu) {
+				update_y_markers(&data[i], trace_pid);
 #if 0
-		printf("[%u] %f %u %u %u '%s' | '%s' | %f\n", data.id, data.ts,
-		 data.pid, data.arrived, data.cpu, data.comm, data.marker,
-		 data.raw_ts);
+				printf("[%u] %f %u %u %u '%s' | '%s' | %f\n",
+				 data[i].id, data[i].ts, data[i].pid,
+				 data[i].arrived, data[i].cpu, data[i].comm,
+				 data[i].marker, data[i].raw_ts);
 #endif
-		} else {
+			} else {
 #if 0
-		printf("[%u] %f %u %u %u '%s' | '%s' | %f\n", data.id, data.ts,
-		 data.pid, data.arrived, data.cpu, data.comm, data.marker,
-		 data.raw_ts);
+				printf("[%u] %f %u %u %u '%s' | '%s' | %f\n",
+				 data[i].id, data[i].ts, data[i].pid,
+				 data[i].arrived, data[i].cpu, data[i].comm,
+				 data[i].marker, data[i].raw_ts);
 #endif
-			add_data_point(&data);
-			plot_.plot_data.push_back(std::move(data));
+				add_data_point(&data[i]);
+				plot_.plot_data.push_back(std::move(data[i]));
+			}
 		}
 
 		ptr++;
